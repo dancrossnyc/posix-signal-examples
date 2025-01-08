@@ -27,66 +27,56 @@
 #include <string.h>
 #include <unistd.h>
 
-// The signals that we care about handling.  We map between
-// these (which are dense and ordered, so can be used to size
-// arrays and so forth) and the actual signal number (which is
-// system dependent.
-typedef enum SpSigno SpSigno;
-enum SpSigno {
-	SpSIGINT,
-	SpSIGQUIT,
-	SpSIGHUP,
-	SpSIGUSR1,
+// This lists signals that we care about handling.
+//
+// If we were to sacrifice portability, much of this could be
+// avoided: BSD-style systems offer a symbol called NSIG that is
+// the total number of signals, and that number is guaranteed to
+// be reasonably small; sadly, this is not in POSIX.  Similarly,
+// BSD has an array called `sys_signame` that contains the short
+// names of all signals.  Thus, on such systems, we could index
+// directly by signal number, but we don't do that to be
+// maximally portable.
+static const struct {
+	const int signum;
+	const char *name;
+} sigmap[] = {
+	{ SIGINT,  "SIGINT"  },
+	{ SIGTSTP, "SIGTSTP" },
+	{ SIGQUIT, "SIGQUIT" },
+	{ SIGHUP,  "SIGHUP"  },
+	{ SIGUSR1, "SIGUSR1" },
 };
 
-// The maximum signal number.  Note that this is not part of the
-// `enum` above; some compilers will warn if we try to e.g.
-// index based on into an array that is exactly sized to the
-// number of elements in the enum, or if we have a switch that
-// doesn't have an explicit `case` for the max size element.
-// Making this a constant outside of the enumeration works this.
-enum { SP_SIGMAX = SpSIGUSR1 + 1 };
+#define	NSIGMAP (sizeof(sigmap) / sizeof(sigmap[0]))
 
-// Maps from our internal signal identifier to the system's
+// Maps from our internal signal index to the system's
 // signal number.
-int
-sptosigno(SpSigno signo)
+static int
+indexsignum(const size_t sigidx)
 {
-	const int sigmap[SP_SIGMAX] = {
-	    [SpSIGINT] = SIGINT,
-	    [SpSIGQUIT] = SIGQUIT,
-	    [SpSIGHUP] = SIGHUP,
-	    [SpSIGUSR1] = SIGUSR1,
-	};
-	return sigmap[signo];
+	assert(sigidx < NSIGMAP);
+	return sigmap[sigidx].signum;
 }
 
-// Mapes from out internal signal identifier to a signal name,
+// Mapes from out internal signal index to a signal name,
 // like `SIGINT` etc.
-const char *
-sptosigname(SpSigno signo)
+static const char *
+indexsigname(const size_t sigidx)
 {
-	switch (signo) {
-	case SpSIGINT:	return "SIGINT";
-	case SpSIGQUIT:	return "SIGQUIT";
-	case SpSIGHUP:	return "SIGHUP";
-	case SpSIGUSR1:	return "SIGUSR1";
-	}
-	fprintf(stderr, "Unhandleable signal: %d\n", signo);
-	_exit(EXIT_FAILURE);
+	assert(sigidx < NSIGMAP);
+	return sigmap[sigidx].name;
 }
 
-// Maps from signal number to our internal identifier.
-SpSigno
-signotosp(int signo)
+// Maps from signal number to map index.
+static size_t
+sigindex(const int signum)
 {
-	switch (signo) {
-	case SIGINT:	return SpSIGINT;
-	case SIGQUIT:	return SpSIGQUIT;
-	case SIGHUP:	return SpSIGHUP;
-	case SIGUSR1:	return SpSIGUSR1;
+	for (size_t k = 0; k < NSIGMAP; ++k) {
+		if (sigmap[k].signum == signum)
+			return k;
 	}
-	fprintf(stderr, "Unhandleable signal: %d\n", signo);
+	fprintf(stderr, "Unhandleable signal: %d\n", signum);
 	_exit(EXIT_FAILURE);
 }
 
@@ -103,7 +93,7 @@ struct Aux {
 };
 
 // The aux information for our signals of itnerest.
-Aux sigaux[SP_SIGMAX];
+static Aux sigaux[NSIGMAP];
 
 static void *
 notifier(void *vaux)
@@ -121,21 +111,23 @@ notifier(void *vaux)
 }
 
 static void
-handler(int signo)
+handler(int signum)
 {
-	SpSigno sp = signotosp(signo);
-	Aux *ap = &sigaux[sp];
-	char b = (char)signo;
+	const size_t si = sigindex(signum);
+	const Aux *ap = &sigaux[si];
+	char b = (char)signum;
 	(void)write(ap->pds[1], &b, sizeof(b));
 }
 
 // Sets up a signal for handling.  Returns a pointer to a
-// static, initialized, owned condition variable that will be
+// static, initialized condition variable that will be
 // broadcast on when the given signal is received.
 static pthread_cond_t *
-initselfpipe(SpSigno signo)
+initselfpipe(const size_t si)
 {
-	Aux *ap = &sigaux[signo];
+	assert(si < NSIGMAP);
+
+	Aux *ap = &sigaux[si];
 	struct sigaction sa;
 
 	// Create the self-pipe itself.
@@ -153,9 +145,10 @@ initselfpipe(SpSigno signo)
 	// to a full pipe will just fail and the notification for
 	// any signals that the write was in response to will be
 	// discarded.  But in practice this is not an issue since a)
-	// signals are edge triggered, and b) if we can't write into
-	// the pipe this implies that there are existing notification
-	// messages in the pipe, so the receiver will process those.
+	// signals are edge triggered anyway, and b) if we can't write
+	// into the pipe this implies that there are existing
+	// notification messages there already, so the receiver will
+	// absorb notification of our event when it process those.
 	if (fcntl(ap->pds[1], F_SETFL, O_NONBLOCK) < 0) {
 		perror("fcntl(O_NONBLOCK)");
 		exit(EXIT_FAILURE);
@@ -171,7 +164,7 @@ initselfpipe(SpSigno signo)
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = handler;
 	sa.sa_flags = SA_RESTART;
-	if (sigaction(sptosigno(signo), &sa, NULL) < 0) {
+	if (sigaction(indexsignum(si), &sa, NULL) < 0) {
 		perror("sigaction");
 		exit(EXIT_FAILURE);
 	}
@@ -182,11 +175,11 @@ initselfpipe(SpSigno signo)
 /*
  * A basic test harness.
  */
-typedef struct SigData SigData;
-struct SigData {
+typedef struct SigThrData SigThrData;
+struct SigThrData {
 	pthread_cond_t *cv;
-	const char *signame;
-	int signo;
+	const char *name;
+	int signum;
 	pthread_t tid;
 };
 
@@ -194,31 +187,33 @@ void *
 cvwaiter(void *arg)
 {
 	int times = 0;
-	SigData *data = arg;
 	pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+	SigThrData *data = arg;
+
+	assert(data != NULL);
 
 	pthread_mutex_lock(&mtx);
 	for (;;) {
 		pthread_cond_wait(data->cv, &mtx);
-		printf("Recevied signal %s (%d)\n", data->signame, data->signo);
+		printf("Recevied signal %s (%d)\n", data->name, data->signum);
 		if (++times == 10) {
-			printf("received %s %d times; bailing.\n", data->signame, times);
+			printf("received %s %d times; bailing.\n", data->name, times);
 			_exit(EXIT_SUCCESS);
 		}
 	}
 }
 
-static SigData sigdata[SP_SIGMAX];
+static SigThrData sigdata[NSIGMAP];
 
 void
 initsigs(void)
 {
-	for (SpSigno k = 0; k < SP_SIGMAX; ++k) {
-		SigData *data = &sigdata[k];
+	for (size_t k = 0; k < NSIGMAP; ++k) {
+		SigThrData *data = &sigdata[k];
 		data->cv = initselfpipe(k);
 		assert(data->cv != NULL);
-		data->signame = sptosigname(k);
-		data->signo = sptosigno(k);
+		data->name = indexsigname(k);
+		data->signum = indexsignum(k);
 		if (pthread_create(&data->tid, NULL, cvwaiter, data) < 0) {
 			perror("pthread_create");
 			exit(EXIT_FAILURE);
